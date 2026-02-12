@@ -2,8 +2,8 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>rover_autonomy</name>
-  <version>1.0.0</version>
-  <description>Rover control package for ESP32-based rover with MQTT bridge (ROS2 Jazzy)</description>
+  <version>2.0.0</version>
+  <description>Autonomous rover control package for ESP32-based Szuflada V2 (ROS2 Jazzy)</description>
   <maintainer email="jakubgoleman12@gmail.com">user</maintainer>
   <license>MIT</license>
 
@@ -11,8 +11,12 @@
   <depend>std_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>cv_bridge</depend>
 
   <exec_depend>ros2launch</exec_depend>
+  <exec_depend>depthimage_to_laserscan</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
