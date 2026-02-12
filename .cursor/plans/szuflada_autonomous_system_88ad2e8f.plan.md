@@ -16,7 +16,7 @@ todos:
     status: completed
   - id: phase2-realsense
     content: "Phase 2: Install realsense2_camera + depthimage_to_laserscan, add to launch file"
-    status: in_progress
+    status: completed
   - id: phase3-obstacle
     content: "Phase 3: Create obstacle_avoidance.py -- reactive obstacle avoidance using /scan + /range"
     status: completed
@@ -25,10 +25,10 @@ todos:
     status: completed
   - id: phase5-slam
     content: "Phase 5: Install slam_toolbox, create slam_params.yaml config"
-    status: in_progress
+    status: completed
   - id: phase6-nav2
     content: "Phase 6: Install Nav2, create nav2_params.yaml, create nav launch file"
-    status: in_progress
+    status: completed
   - id: phase7-visual
     content: "Phase 7: Create visual_tracker.py -- OpenCV color/object tracking from RealSense RGB"
     status: completed

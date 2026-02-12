@@ -54,7 +54,8 @@ class OdometryNode(Node):
         self.declare_parameter('mqtt_port', 1883)
         self.declare_parameter('wheel_diameter', 0.065)
         self.declare_parameter('wheel_base', 0.20)
-        self.declare_parameter('encoder_ticks_per_rev', 20)
+        self.declare_parameter('encoder_ticks_per_rev_left', 60000)
+        self.declare_parameter('encoder_ticks_per_rev_right', 228000)
         self.declare_parameter('motor_inversion', True)
 
         # Read parameters
@@ -62,12 +63,14 @@ class OdometryNode(Node):
         self.mqtt_port = self.get_parameter('mqtt_port').get_parameter_value().integer_value
         self.wheel_diameter = self.get_parameter('wheel_diameter').get_parameter_value().double_value
         self.wheel_base = self.get_parameter('wheel_base').get_parameter_value().double_value
-        self.ticks_per_rev = self.get_parameter('encoder_ticks_per_rev').get_parameter_value().integer_value
+        self.ticks_per_rev_left = self.get_parameter('encoder_ticks_per_rev_left').get_parameter_value().integer_value
+        self.ticks_per_rev_right = self.get_parameter('encoder_ticks_per_rev_right').get_parameter_value().integer_value
         self.motor_inversion = self.get_parameter('motor_inversion').get_parameter_value().bool_value
 
         # Derived
         self.wheel_radius = self.wheel_diameter / 2.0
-        self.meters_per_tick = (math.pi * self.wheel_diameter) / self.ticks_per_rev
+        self.meters_per_tick_left = (math.pi * self.wheel_diameter) / self.ticks_per_rev_left
+        self.meters_per_tick_right = (math.pi * self.wheel_diameter) / self.ticks_per_rev_right
 
         # Odometry state
         self.x = 0.0
@@ -110,7 +113,7 @@ class OdometryNode(Node):
 
         self.get_logger().info(
             f'Odometry params: wheel_d={self.wheel_diameter}m, '
-            f'base={self.wheel_base}m, ticks/rev={self.ticks_per_rev}'
+            f'base={self.wheel_base}m, ticks/rev L={self.ticks_per_rev_left} R={self.ticks_per_rev_right}'
         )
 
     def _cmd_vel_callback(self, msg):
@@ -147,11 +150,11 @@ class OdometryNode(Node):
             # Apply direction (inferred from last cmd_vel)
             if self.motor_inversion:
                 # Forward = negative PWM, so invert direction inference
-                d_left = delta_left * self.meters_per_tick * (-self.left_direction)
-                d_right = delta_right * self.meters_per_tick * (-self.right_direction)
+                d_left = delta_left * self.meters_per_tick_left * (-self.left_direction)
+                d_right = delta_right * self.meters_per_tick_right * (-self.right_direction)
             else:
-                d_left = delta_left * self.meters_per_tick * self.left_direction
-                d_right = delta_right * self.meters_per_tick * self.right_direction
+                d_left = delta_left * self.meters_per_tick_left * self.left_direction
+                d_right = delta_right * self.meters_per_tick_right * self.right_direction
 
             # Differential drive odometry
             d_center = (d_left + d_right) / 2.0

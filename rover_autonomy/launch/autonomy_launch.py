@@ -40,7 +40,7 @@ def generate_launch_description():
             'mqtt_port': mqtt_port,
             'max_pwm': 255,
             'max_linear_speed': 0.3,
-            'wheel_base': 0.20,
+            'wheel_base': 0.40,
             'motor_inversion': True,
             'timeout_sec': 0.5,
         }]
@@ -55,9 +55,10 @@ def generate_launch_description():
         parameters=[{
             'mqtt_broker': mqtt_broker,
             'mqtt_port': mqtt_port,
-            'wheel_diameter': 0.065,
-            'wheel_base': 0.20,
-            'encoder_ticks_per_rev': 20,
+            'wheel_diameter': 0.126,
+            'wheel_base': 0.40,
+            'encoder_ticks_per_rev_left': 60000,
+            'encoder_ticks_per_rev_right': 228000,
             'motor_inversion': True,
         }]
     )

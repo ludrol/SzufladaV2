@@ -50,6 +50,8 @@ setup(
             'wall_follower = rover_autonomy.wall_follower:main',
             # --- Phase 7: Visual tracking ---
             'visual_tracker = rover_autonomy.visual_tracker:main',
+            # --- Calibration tools ---
+            'encoder_calibration = rover_autonomy.encoder_calibration:main',
         ],
     },
 )
