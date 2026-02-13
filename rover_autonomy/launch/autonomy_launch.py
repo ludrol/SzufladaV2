@@ -1,12 +1,20 @@
 """
 Main autonomy launch file for Szuflada V2 (ROS2 Jazzy).
 
-Launches the core nodes:
-    - cmd_vel_bridge (Twist -> MQTT motors)
-    - odometry_node (encoder MQTT -> /odom + TF)
-    - robot_description (static TF frames)
-    - distance_sensor_mqtt (ultrasonic MQTT -> /range)
-    - depthimage_to_laserscan (depth camera -> /scan)
+Launches the UNIFIED core stack with a SINGLE MQTT connection:
+
+    mqtt_bridge       -- ONE MQTT connection (ESP32 <-> ROS2)
+    cmd_vel_bridge    -- /cmd_vel -> /motor_left, /motor_right (pure ROS2)
+    odometry_node     -- /encoder_raw -> /odom + TF (pure ROS2)
+    robot_description -- static TF frames (pure ROS2)
+    depthimage_to_laserscan -- depth camera -> /scan
+
+After launching this, run ONE behavior node in a separate terminal:
+    ros2 run rover_autonomy rover_teleop
+    ros2 run rover_autonomy obstacle_avoidance
+    ros2 run rover_autonomy wall_follower
+    ros2 run rover_autonomy visual_tracker
+    ros2 run rover_autonomy move_distance --ros-args -p distance:=0.5
 
 Usage:
     ros2 launch rover_autonomy autonomy_launch.py
@@ -20,50 +28,61 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    # Common arguments
+    # ── Launch Arguments ────────────────────────────────────────────
     mqtt_broker_arg = DeclareLaunchArgument(
-        'mqtt_broker', default_value='192.168.1.1')
+        'mqtt_broker', default_value='192.168.1.1',
+        description='IP address of the MQTT broker')
     mqtt_port_arg = DeclareLaunchArgument(
-        'mqtt_port', default_value='1883')
+        'mqtt_port', default_value='1883',
+        description='MQTT broker port')
 
     mqtt_broker = LaunchConfiguration('mqtt_broker')
     mqtt_port = LaunchConfiguration('mqtt_port')
 
-    # cmd_vel bridge
+    # ── mqtt_bridge: THE SINGLE MQTT CONNECTION ─────────────────────
+    mqtt_bridge = Node(
+        package='rover_autonomy',
+        executable='mqtt_bridge',
+        name='mqtt_bridge',
+        output='screen',
+        parameters=[{
+            'mqtt_broker': mqtt_broker,
+            'mqtt_port': mqtt_port,
+        }]
+    )
+
+    # ── cmd_vel_bridge: /cmd_vel -> motor PWM (no MQTT) ─────────────
     cmd_vel_bridge = Node(
         package='rover_autonomy',
         executable='cmd_vel_bridge',
         name='cmd_vel_bridge',
         output='screen',
         parameters=[{
-            'mqtt_broker': mqtt_broker,
-            'mqtt_port': mqtt_port,
             'max_pwm': 255,
             'max_linear_speed': 0.3,
             'wheel_base': 0.40,
             'motor_inversion': True,
             'timeout_sec': 0.5,
+            'right_trim': 1.0,
         }]
     )
 
-    # Odometry
+    # ── odometry_node: encoders -> /odom + TF (no MQTT) ────────────
     odometry = Node(
         package='rover_autonomy',
         executable='odometry_node',
         name='odometry_node',
         output='screen',
         parameters=[{
-            'mqtt_broker': mqtt_broker,
-            'mqtt_port': mqtt_port,
             'wheel_diameter': 0.126,
             'wheel_base': 0.40,
-            'encoder_ticks_per_rev_left': 60000,
-            'encoder_ticks_per_rev_right': 228000,
+            'encoder_ticks_per_rev_left': 6220,
+            'encoder_ticks_per_rev_right': 35750,
             'motor_inversion': True,
         }]
     )
 
-    # Robot description (static TF)
+    # ── robot_description: static TF frames (already pure ROS2) ────
     robot_desc = Node(
         package='rover_autonomy',
         executable='robot_description',
@@ -79,20 +98,7 @@ def generate_launch_description():
         }]
     )
 
-    # Distance sensor MQTT bridge (ultrasonic)
-    distance_sensor = Node(
-        package='rover_autonomy',
-        executable='distance_sensor_mqtt',
-        name='distance_sensor_mqtt',
-        output='screen',
-        parameters=[{
-            'mqtt_broker': mqtt_broker,
-            'mqtt_port': mqtt_port,
-            'distance_threshold': 0.5,
-        }]
-    )
-
-    # depthimage_to_laserscan (virtual lidar from RealSense depth)
+    # ── depthimage_to_laserscan: depth camera -> /scan ──────────────
     depth_to_scan = Node(
         package='depthimage_to_laserscan',
         executable='depthimage_to_laserscan_node',
@@ -115,9 +121,9 @@ def generate_launch_description():
     return LaunchDescription([
         mqtt_broker_arg,
         mqtt_port_arg,
+        mqtt_bridge,
         cmd_vel_bridge,
         odometry,
         robot_desc,
-        distance_sensor,
         depth_to_scan,
     ])

@@ -1,13 +1,19 @@
 """
 Rover Teleop Node for ROS2 Jazzy.
 
-Provides keyboard-based teleoperation of the ESP32 rover via MQTT.
-Subscribes to MQTT distance/encoder data and publishes to ROS2 topics.
-Sends motor and LED commands to ESP32 via MQTT.
+Continuous keyboard-based teleoperation.
+Press a key to SET the driving state -- it keeps going until you
+press another key or SPACE to stop. No "one-shot" steps.
+
+Publishes /cmd_vel at 10 Hz continuously.
+The cmd_vel_bridge converts it to motor PWM, and mqtt_bridge
+sends it to the ESP32. This node has ZERO MQTT dependency.
 
 Controls:
-    W = Forward       A = Turn Left
-    S = Backward      D = Turn Right
+    W = Drive forward (continuous)
+    S = Drive backward (continuous)
+    A = Turn left (continuous)
+    D = Turn right (continuous)
     SPACE = Stop
     L = Toggle LED
     +/- = Increase/Decrease speed
@@ -15,241 +21,182 @@ Controls:
 """
 
 import sys
+import select
 import termios
 import tty
+import threading
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32, String
 from geometry_msgs.msg import Twist
-
-try:
-    import paho.mqtt.client as mqtt
-    PAHO_V2 = hasattr(mqtt, 'CallbackAPIVersion')
-except ImportError:
-    raise ImportError(
-        "paho-mqtt is required. Install with: pip3 install paho-mqtt"
-    )
+from std_msgs.msg import String
 
 
 class RoverTeleopNode(Node):
-    """Keyboard teleoperation node for the rover."""
+    """Continuous keyboard teleoperation node (pure ROS2, no MQTT)."""
 
     def __init__(self):
         super().__init__('rover_teleop')
 
         # Declare parameters
-        self.declare_parameter('mqtt_broker', '192.168.1.1')
-        self.declare_parameter('mqtt_port', 1883)
-        self.declare_parameter('default_speed', 150)
+        self.declare_parameter('default_speed', 0.15)
+        self.declare_parameter('turn_speed', 0.6)
+        self.declare_parameter('speed_step', 0.03)
+        self.declare_parameter('max_speed', 0.3)
+        self.declare_parameter('min_speed', 0.03)
 
         # Read parameters
-        self.mqtt_broker = self.get_parameter('mqtt_broker').get_parameter_value().string_value
-        self.mqtt_port = self.get_parameter('mqtt_port').get_parameter_value().integer_value
-        self.motor_speed = self.get_parameter('default_speed').get_parameter_value().integer_value
+        self.linear_speed = self.get_parameter(
+            'default_speed').get_parameter_value().double_value
+        self.turn_speed = self.get_parameter(
+            'turn_speed').get_parameter_value().double_value
+        self.speed_step = self.get_parameter(
+            'speed_step').get_parameter_value().double_value
+        self.max_speed = self.get_parameter(
+            'max_speed').get_parameter_value().double_value
+        self.min_speed = self.get_parameter(
+            'min_speed').get_parameter_value().double_value
 
-        # MQTT Topics (matching ESP32 code)
-        self.topic_led = 'sensor/led'
-        self.topic_motor_left = 'motor/left'
-        self.topic_motor_right = 'motor/right'
-        self.topic_distance = 'sensor/distance'
-        self.topic_encoder = 'sensor/encoder'
-
-        # State
+        # Current driving state (updated by keypresses)
+        self.current_linear = 0.0
+        self.current_angular = 0.0
         self.led_on = False
-        self.current_left = 0
-        self.current_right = 0
+        self.running = True
 
-        # ROS2 Publishers - republish sensor data from MQTT into ROS2
-        self.distance_pub = self.create_publisher(Float32, 'distance', 10)
-        self.encoder_pub = self.create_publisher(String, 'encoder', 10)
+        # ROS2 Publishers
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.led_pub = self.create_publisher(String, 'led_cmd', 10)
 
-        # --- MQTT Client Setup (paho-mqtt v2.x compatible) ---
-        if PAHO_V2:
-            self.mqtt_client = mqtt.Client(
-                callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-                client_id='ros2_rover_teleop'
-            )
-        else:
-            self.mqtt_client = mqtt.Client(client_id='ros2_rover_teleop')
-
-        self.mqtt_client.on_connect = self._on_mqtt_connect
-        self.mqtt_client.on_message = self._on_mqtt_message
-
-        try:
-            self.mqtt_client.connect(self.mqtt_broker, self.mqtt_port, 60)
-            self.mqtt_client.loop_start()
-            self.get_logger().info(
-                f'Connected to MQTT broker at {self.mqtt_broker}'
-            )
-        except Exception as e:
-            self.get_logger().error(f'Failed to connect: {e}')
-            return
+        # Timer publishes current state at 10 Hz (continuous!)
+        self.create_timer(0.1, self._publish_current_state)
 
         self._print_instructions()
-        self._read_keyboard()
 
-    def _on_mqtt_connect(self, client, userdata, flags, reason_code, properties=None):
-        """MQTT connect callback (v2 API)."""
-        self.get_logger().info('MQTT Connected!')
-        client.subscribe(self.topic_distance)
-        client.subscribe(self.topic_encoder)
-
-    def _on_mqtt_message(self, client, userdata, msg):
-        """MQTT message callback - bridge sensor data to ROS2."""
-        try:
-            if msg.topic == self.topic_distance:
-                distance = float(msg.payload.decode())
-                ros_msg = Float32()
-                ros_msg.data = distance
-                self.distance_pub.publish(ros_msg)
-            elif msg.topic == self.topic_encoder:
-                enc_msg = String()
-                enc_msg.data = msg.payload.decode()
-                self.encoder_pub.publish(enc_msg)
-        except Exception:
-            pass
+        # Run keyboard reading in a background thread so rclpy.spin works
+        self.kb_thread = threading.Thread(target=self._read_keyboard, daemon=True)
+        self.kb_thread.start()
 
     def _print_instructions(self):
         """Print teleop control instructions."""
         print('\n' + '=' * 50)
-        print('    MARS ROVER TELEOP CONTROL (ROS2 Jazzy)')
+        print('    SZUFLADA V2 TELEOP (ROS2 Jazzy)')
         print('=' * 50)
-        print('  Movement:')
+        print('  Movement (CONTINUOUS -- holds until changed):')
         print('            W')
         print('        A   S   D       W = Forward')
         print('                        S = Backward')
         print('                        A = Turn Left')
         print('                        D = Turn Right')
         print('')
-        print('  Other Controls:')
-        print('    SPACE = Stop')
-        print('    L     = Toggle LED')
-        print('    +/-   = Increase/Decrease speed')
-        print('    Q     = Quit')
+        print('  SPACE = STOP')
+        print('  L     = Toggle LED')
+        print('  +/-   = Increase/Decrease speed')
+        print('  Q     = Quit')
         print('')
-        print(f'  Current Speed: {self.motor_speed}/255')
+        print(f'  Linear speed : {self.linear_speed:.2f} m/s')
+        print(f'  Turn speed   : {self.turn_speed:.2f} rad/s')
         print('=' * 50 + '\n')
 
-    def _get_key(self):
-        """Read a single keypress from terminal."""
+    def _publish_current_state(self):
+        """Timer callback: continuously publish the current driving state."""
+        twist = Twist()
+        twist.linear.x = self.current_linear
+        twist.angular.z = self.current_angular
+        self.cmd_vel_pub.publish(twist)
+
+    def _read_keyboard(self):
+        """Background thread: read keypresses and update driving state."""
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
         try:
-            tty.setraw(fd)
-            key = sys.stdin.read(1)
+            tty.setcbreak(fd)  # cbreak mode: keys available immediately
+            while self.running and rclpy.ok():
+                # Non-blocking check: wait up to 0.1s for a keypress
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    key = sys.stdin.read(1)
+                    self._handle_key(key)
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        return key
 
-    def _read_keyboard(self):
-        """Main keyboard reading loop."""
-        while rclpy.ok():
-            key = self._get_key()
+    def _handle_key(self, key):
+        """Update driving state based on keypress."""
+        if key.lower() == 'w':
+            self.current_linear = self.linear_speed
+            self.current_angular = 0.0
+            self.get_logger().info(
+                f'FORWARD (speed: {self.linear_speed:.2f} m/s)')
 
-            if key.lower() == 'w':
-                self._move_forward()
-            elif key.lower() == 's':
-                self._move_backward()
-            elif key.lower() == 'a':
-                self._turn_left()
-            elif key.lower() == 'd':
-                self._turn_right()
-            elif key == ' ':
-                self._stop()
-            elif key.lower() == 'l':
-                self._toggle_led()
-            elif key in ('+', '='):
-                self._increase_speed()
-            elif key == '-':
-                self._decrease_speed()
-            elif key.lower() == 'q' or key == '\x03':
-                self._stop()
-                self.get_logger().info('Exiting...')
-                break
+        elif key.lower() == 's':
+            self.current_linear = -self.linear_speed
+            self.current_angular = 0.0
+            self.get_logger().info(
+                f'BACKWARD (speed: {self.linear_speed:.2f} m/s)')
 
-    def _move_forward(self):
-        """Drive forward (both motors negative per original calibration)."""
-        self.current_left = -self.motor_speed
-        self.current_right = -self.motor_speed
-        self._send_motor_commands()
-        self._publish_cmd_vel(1.0, 0.0)
-        self.get_logger().info(f'FORWARD (speed: {self.motor_speed})')
+        elif key.lower() == 'a':
+            self.current_linear = 0.0
+            self.current_angular = self.turn_speed
+            self.get_logger().info(
+                f'TURN LEFT (speed: {self.turn_speed:.2f} rad/s)')
 
-    def _move_backward(self):
-        """Drive backward (both motors positive per original calibration)."""
-        self.current_left = self.motor_speed
-        self.current_right = self.motor_speed
-        self._send_motor_commands()
-        self._publish_cmd_vel(-1.0, 0.0)
-        self.get_logger().info(f'BACKWARD (speed: {self.motor_speed})')
+        elif key.lower() == 'd':
+            self.current_linear = 0.0
+            self.current_angular = -self.turn_speed
+            self.get_logger().info(
+                f'TURN RIGHT (speed: {self.turn_speed:.2f} rad/s)')
 
-    def _turn_left(self):
-        """Turn left (differential drive)."""
-        self.current_left = self.motor_speed
-        self.current_right = -self.motor_speed
-        self._send_motor_commands()
-        self._publish_cmd_vel(0.0, 1.0)
-        self.get_logger().info(f'TURN LEFT (speed: {self.motor_speed})')
+        elif key == ' ':
+            self.current_linear = 0.0
+            self.current_angular = 0.0
+            self.get_logger().info('STOP')
 
-    def _turn_right(self):
-        """Turn right (differential drive)."""
-        self.current_left = -self.motor_speed
-        self.current_right = self.motor_speed
-        self._send_motor_commands()
-        self._publish_cmd_vel(0.0, -1.0)
-        self.get_logger().info(f'TURN RIGHT (speed: {self.motor_speed})')
+        elif key.lower() == 'l':
+            self.led_on = not self.led_on
+            command = 'ON' if self.led_on else 'OFF'
+            led_msg = String()
+            led_msg.data = command
+            self.led_pub.publish(led_msg)
+            self.get_logger().info(f'LED: {command}')
 
-    def _stop(self):
-        """Stop both motors."""
-        self.current_left = 0
-        self.current_right = 0
-        self._send_motor_commands()
-        self._publish_cmd_vel(0.0, 0.0)
-        self.get_logger().info('STOP')
+        elif key in ('+', '='):
+            self.linear_speed = min(
+                self.max_speed, self.linear_speed + self.speed_step)
+            self.get_logger().info(
+                f'Speed: {self.linear_speed:.2f} m/s')
 
-    def _send_motor_commands(self):
-        """Publish motor speed commands via MQTT to ESP32."""
-        self.mqtt_client.publish(self.topic_motor_left, str(self.current_left))
-        self.mqtt_client.publish(self.topic_motor_right, str(self.current_right))
+        elif key == '-':
+            self.linear_speed = max(
+                self.min_speed, self.linear_speed - self.speed_step)
+            self.get_logger().info(
+                f'Speed: {self.linear_speed:.2f} m/s')
 
-    def _publish_cmd_vel(self, linear_x, angular_z):
-        """Also publish a Twist message on cmd_vel for ROS2 ecosystem."""
-        twist = Twist()
-        twist.linear.x = linear_x
-        twist.angular.z = angular_z
-        self.cmd_vel_pub.publish(twist)
-
-    def _toggle_led(self):
-        """Toggle ESP32 LED via MQTT."""
-        self.led_on = not self.led_on
-        command = 'ON' if self.led_on else 'OFF'
-        self.mqtt_client.publish(self.topic_led, command)
-        self.get_logger().info(f'LED: {command}')
-
-    def _increase_speed(self):
-        """Increase motor speed by 25 (max 255)."""
-        self.motor_speed = min(255, self.motor_speed + 25)
-        self.get_logger().info(f'Speed: {self.motor_speed}/255')
-
-    def _decrease_speed(self):
-        """Decrease motor speed by 25 (min 25)."""
-        self.motor_speed = max(25, self.motor_speed - 25)
-        self.get_logger().info(f'Speed: {self.motor_speed}/255')
+        elif key.lower() == 'q' or key == '\x03':
+            self.current_linear = 0.0
+            self.current_angular = 0.0
+            self.running = False
+            self.get_logger().info('Exiting...')
 
     def destroy_node(self):
-        """Cleanup MQTT on shutdown."""
-        self.mqtt_client.loop_stop()
-        self.mqtt_client.disconnect()
+        """Stop on shutdown."""
+        self.running = False
+        self.current_linear = 0.0
+        self.current_angular = 0.0
+        # Send a few stop commands to make sure motors halt
+        twist = Twist()
+        for _ in range(5):
+            self.cmd_vel_pub.publish(twist)
         super().destroy_node()
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = RoverTeleopNode()
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

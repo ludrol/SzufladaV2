@@ -1,18 +1,24 @@
 """
 Odometry Node for ROS2 Jazzy.
 
-Reads encoder data from ESP32 via MQTT and computes wheel odometry
-using differential drive kinematics.
+Reads encoder data from /encoder_raw (published by mqtt_bridge) and
+computes wheel odometry using differential drive kinematics.
+
+This node has ZERO MQTT dependency.
+
+Noise filtering:
+    - When motors are stopped (cmd_vel = 0), encoder ticks are IGNORED
+      because the encoders pick up EMI noise from the motor driver.
+    - A configurable min_delta_ticks deadzone filters residual noise
+      even while driving.
 
 Publishes:
     - nav_msgs/Odometry on /odom
     - TF: odom -> base_link
 
-ESP32 encoder format (every 200ms):
-    "enc1_total,enc2_total,enc1_delta,enc2_delta"
-
-Note: Encoders are direction-blind (only count up). Direction is
-inferred from the last /cmd_vel command.
+Subscribes:
+    - /encoder_raw (std_msgs/String) -- format: "enc1_total,enc2_total,enc1_delta,enc2_delta"
+    - /cmd_vel (geometry_msgs/Twist) -- to infer wheel direction (encoders are direction-blind)
 """
 
 import math
@@ -23,14 +29,6 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist, TransformStamped, Quaternion
 from std_msgs.msg import String
 from tf2_ros import TransformBroadcaster
-
-try:
-    import paho.mqtt.client as mqtt
-    PAHO_V2 = hasattr(mqtt, 'CallbackAPIVersion')
-except ImportError:
-    raise ImportError(
-        "paho-mqtt is required. Install with: pip3 install paho-mqtt"
-    )
 
 
 def quaternion_from_yaw(yaw):
@@ -44,33 +42,44 @@ def quaternion_from_yaw(yaw):
 
 
 class OdometryNode(Node):
-    """Computes and publishes odometry from ESP32 encoder data."""
+    """Computes and publishes odometry from encoder data (pure ROS2)."""
 
     def __init__(self):
         super().__init__('odometry_node')
 
         # Declare parameters (calibrate with real measurements)
-        self.declare_parameter('mqtt_broker', '192.168.1.1')
-        self.declare_parameter('mqtt_port', 1883)
         self.declare_parameter('wheel_diameter', 0.065)
         self.declare_parameter('wheel_base', 0.20)
-        self.declare_parameter('encoder_ticks_per_rev_left', 60000)
-        self.declare_parameter('encoder_ticks_per_rev_right', 228000)
+        self.declare_parameter('encoder_ticks_per_rev_left', 33500)
+        self.declare_parameter('encoder_ticks_per_rev_right', 153000)
         self.declare_parameter('motor_inversion', True)
+        self.declare_parameter('min_delta_ticks', 3)
+        self.declare_parameter('stop_grace_sec', 0.4)
 
         # Read parameters
-        self.mqtt_broker = self.get_parameter('mqtt_broker').get_parameter_value().string_value
-        self.mqtt_port = self.get_parameter('mqtt_port').get_parameter_value().integer_value
-        self.wheel_diameter = self.get_parameter('wheel_diameter').get_parameter_value().double_value
-        self.wheel_base = self.get_parameter('wheel_base').get_parameter_value().double_value
-        self.ticks_per_rev_left = self.get_parameter('encoder_ticks_per_rev_left').get_parameter_value().integer_value
-        self.ticks_per_rev_right = self.get_parameter('encoder_ticks_per_rev_right').get_parameter_value().integer_value
-        self.motor_inversion = self.get_parameter('motor_inversion').get_parameter_value().bool_value
+        self.wheel_diameter = self.get_parameter(
+            'wheel_diameter').get_parameter_value().double_value
+        self.wheel_base = self.get_parameter(
+            'wheel_base').get_parameter_value().double_value
+        self.ticks_per_rev_left = self.get_parameter(
+            'encoder_ticks_per_rev_left').get_parameter_value().integer_value
+        self.ticks_per_rev_right = self.get_parameter(
+            'encoder_ticks_per_rev_right').get_parameter_value().integer_value
+        self.motor_inversion = self.get_parameter(
+            'motor_inversion').get_parameter_value().bool_value
+        self.min_delta_ticks = self.get_parameter(
+            'min_delta_ticks').get_parameter_value().integer_value
+        self.stop_grace_sec = self.get_parameter(
+            'stop_grace_sec').get_parameter_value().double_value
 
         # Derived
         self.wheel_radius = self.wheel_diameter / 2.0
-        self.meters_per_tick_left = (math.pi * self.wheel_diameter) / self.ticks_per_rev_left
-        self.meters_per_tick_right = (math.pi * self.wheel_diameter) / self.ticks_per_rev_right
+        self.meters_per_tick_left = (
+            (math.pi * self.wheel_diameter) / self.ticks_per_rev_left
+        )
+        self.meters_per_tick_right = (
+            (math.pi * self.wheel_diameter) / self.ticks_per_rev_right
+        )
 
         # Odometry state
         self.x = 0.0
@@ -82,62 +91,59 @@ class OdometryNode(Node):
         self.left_direction = 1.0
         self.right_direction = 1.0
 
+        # Motor state tracking -- filter noise when stopped
+        self.motors_active = False
+        self.last_nonzero_cmd_time = self.get_clock().now()
+        self.noise_filtered_count = 0
+
         # ROS2 Publishers
         self.odom_pub = self.create_publisher(Odometry, 'odom', 50)
-        self.encoder_pub = self.create_publisher(String, 'encoder', 10)
+        self.encoder_debug_pub = self.create_publisher(String, 'encoder', 10)
         self.tf_broadcaster = TransformBroadcaster(self)
 
         # Subscribe to cmd_vel to infer direction
         self.create_subscription(Twist, 'cmd_vel', self._cmd_vel_callback, 10)
 
-        # --- MQTT Client ---
-        if PAHO_V2:
-            self.mqtt_client = mqtt.Client(
-                callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-                client_id='ros2_odometry'
-            )
-        else:
-            self.mqtt_client = mqtt.Client(client_id='ros2_odometry')
-
-        self.mqtt_client.on_connect = self._on_mqtt_connect
-        self.mqtt_client.on_message = self._on_mqtt_message
-
-        try:
-            self.mqtt_client.connect(self.mqtt_broker, self.mqtt_port, 60)
-            self.mqtt_client.loop_start()
-            self.get_logger().info(
-                f'Odometry node connected to MQTT at {self.mqtt_broker}'
-            )
-        except Exception as e:
-            self.get_logger().error(f'Failed to connect to MQTT: {e}')
+        # Subscribe to encoder data from mqtt_bridge
+        self.create_subscription(
+            String, 'encoder_raw', self._encoder_callback, 50)
 
         self.get_logger().info(
-            f'Odometry params: wheel_d={self.wheel_diameter}m, '
-            f'base={self.wheel_base}m, ticks/rev L={self.ticks_per_rev_left} R={self.ticks_per_rev_right}'
+            f'Odometry node ready (no MQTT). '
+            f'wheel_d={self.wheel_diameter}m, base={self.wheel_base}m, '
+            f'ticks/rev L={self.ticks_per_rev_left} R={self.ticks_per_rev_right}, '
+            f'noise filter: min_delta={self.min_delta_ticks} ticks, '
+            f'stop_grace={self.stop_grace_sec}s'
         )
 
     def _cmd_vel_callback(self, msg):
-        """Track motor direction from cmd_vel for encoder sign inference."""
+        """Track motor direction and activity from cmd_vel."""
         v_left = msg.linear.x - msg.angular.z * (self.wheel_base / 2.0)
         v_right = msg.linear.x + msg.angular.z * (self.wheel_base / 2.0)
 
         self.left_direction = 1.0 if v_left >= 0.0 else -1.0
         self.right_direction = 1.0 if v_right >= 0.0 else -1.0
 
-    def _on_mqtt_connect(self, client, userdata, flags, reason_code, properties=None):
-        """MQTT connect callback."""
-        self.get_logger().info('Odometry MQTT connected')
-        client.subscribe('sensor/encoder')
+        # Track whether motors are being commanded to move
+        if abs(msg.linear.x) > 0.001 or abs(msg.angular.z) > 0.001:
+            self.motors_active = True
+            self.last_nonzero_cmd_time = self.get_clock().now()
+        else:
+            # Allow a short grace period for the wheels to actually stop
+            elapsed = (self.get_clock().now() -
+                       self.last_nonzero_cmd_time).nanoseconds / 1e9
+            if elapsed > self.stop_grace_sec:
+                self.motors_active = False
 
-    def _on_mqtt_message(self, client, userdata, msg):
-        """Process encoder data from ESP32."""
+    def _encoder_callback(self, msg):
+        """Process encoder data from mqtt_bridge."""
         try:
-            data = msg.payload.decode().strip()
+            data = msg.data.strip()
 
-            # Also republish as String for debugging
-            enc_msg = String()
-            enc_msg.data = data
-            self.encoder_pub.publish(enc_msg)
+            # Republish as debug topic
+            debug_msg = String()
+            debug_msg.data = data
+            self.encoder_debug_pub.publish(debug_msg)
 
             # Parse: "enc1_total,enc2_total,enc1_delta,enc2_delta"
             parts = data.split(',')
@@ -147,14 +153,39 @@ class OdometryNode(Node):
             delta_left = abs(int(parts[2]))
             delta_right = abs(int(parts[3]))
 
+            # ── NOISE FILTER ────────────────────────────────────────
+            # When motors are stopped, encoder ticks are EMI noise.
+            # Also filter tiny deltas even while driving.
+            if not self.motors_active:
+                if delta_left > 0 or delta_right > 0:
+                    self.noise_filtered_count += 1
+                    if self.noise_filtered_count % 25 == 1:
+                        self.get_logger().info(
+                            f'Noise filtered: L={delta_left} R={delta_right} '
+                            f'(motors stopped, {self.noise_filtered_count} '
+                            f'total filtered)')
+                # Still publish odom (same position) to keep TF alive
+                delta_left = 0
+                delta_right = 0
+            else:
+                # While driving, apply deadzone for small noise spikes
+                if delta_left < self.min_delta_ticks:
+                    delta_left = 0
+                if delta_right < self.min_delta_ticks:
+                    delta_right = 0
+                self.noise_filtered_count = 0
+
             # Apply direction (inferred from last cmd_vel)
             if self.motor_inversion:
-                # Forward = negative PWM, so invert direction inference
-                d_left = delta_left * self.meters_per_tick_left * (-self.left_direction)
-                d_right = delta_right * self.meters_per_tick_right * (-self.right_direction)
+                d_left = delta_left * self.meters_per_tick_left * (
+                    -self.left_direction)
+                d_right = delta_right * self.meters_per_tick_right * (
+                    -self.right_direction)
             else:
-                d_left = delta_left * self.meters_per_tick_left * self.left_direction
-                d_right = delta_right * self.meters_per_tick_right * self.right_direction
+                d_left = delta_left * self.meters_per_tick_left * (
+                    self.left_direction)
+                d_right = delta_right * self.meters_per_tick_right * (
+                    self.right_direction)
 
             # Differential drive odometry
             d_center = (d_left + d_right) / 2.0
@@ -209,8 +240,6 @@ class OdometryNode(Node):
 
     def destroy_node(self):
         """Cleanup."""
-        self.mqtt_client.loop_stop()
-        self.mqtt_client.disconnect()
         super().destroy_node()
 
 

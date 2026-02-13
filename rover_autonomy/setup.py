@@ -35,23 +35,17 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            # --- Phase 0: Manual control ---
-            'distance_sensor_mqtt = rover_autonomy.distance_sensor_mqtt:main',
-            'distance_sensor_serial = rover_autonomy.distance_sensor_serial:main',
-            'rover_teleop = rover_autonomy.rover_teleop:main',
-            'keyboard_led = rover_autonomy.keyboard_led:main',
-            # --- Phase 1: Foundation ---
+            # --- Core (unified stack) ---
+            'mqtt_bridge = rover_autonomy.mqtt_bridge:main',
             'cmd_vel_bridge = rover_autonomy.cmd_vel_bridge:main',
             'odometry_node = rover_autonomy.odometry_node:main',
             'robot_description = rover_autonomy.robot_description:main',
-            # --- Phase 3: Obstacle avoidance ---
+            # --- Behavior nodes (run ONE at a time) ---
+            'rover_teleop = rover_autonomy.rover_teleop:main',
             'obstacle_avoidance = rover_autonomy.obstacle_avoidance:main',
-            # --- Phase 4: Wall following ---
             'wall_follower = rover_autonomy.wall_follower:main',
-            # --- Phase 7: Visual tracking ---
             'visual_tracker = rover_autonomy.visual_tracker:main',
-            # --- Calibration tools ---
-            'encoder_calibration = rover_autonomy.encoder_calibration:main',
+            'move_distance = rover_autonomy.move_distance:main',
         ],
     },
 )
